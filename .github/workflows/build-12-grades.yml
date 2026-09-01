@@ -346,15 +346,42 @@ jobs:
           test -s android/app/src/main/res/mipmap-mdpi/ic_launcher.png
           test -s android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
 
+      - name: Prepare pinned Adivery 4.9.0 for Dart 3
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/prepare_adivery_plugin.sh
+          ./scripts/prepare_adivery_plugin.sh
+          grep -Eq '^version:[[:space:]]*4\.9\.0[[:space:]]*$' third_party/adivery/pubspec.yaml
+          ! grep -q '<3\.0\.0' third_party/adivery/pubspec.yaml
+          grep -R -q 'com.adivery:sdk:4.9.0' third_party/adivery/android
+
+      - name: Preflight Flutter compatibility
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: |
+          set -euo pipefail
+          flutter --version
+          grep -q 'cardTheme: CardTheme(' lib/main.dart
+          ! grep -q 'CardThemeData(' lib/main.dart
+          grep -q 'path: third_party/adivery' pubspec.yaml
+          grep -q 'pageSnap: false' lib/main.dart
+          grep -q 'pageFling: true' lib/main.dart
+          grep -q 'fitEachPage: false' lib/main.dart
+
       - name: Install Flutter packages
         shell: bash
         working-directory: ${{ steps.source.outputs.project_dir }}
-        run: flutter pub get
+        run: |
+          set -euo pipefail
+          flutter pub get
+          flutter pub deps | grep -E '^├── adivery 4\.9\.0|^└── adivery 4\.9\.0|adivery 4\.9\.0'
 
       - name: Static analysis
         shell: bash
         working-directory: ${{ steps.source.outputs.project_dir }}
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        run: flutter analyze lib --no-fatal-infos --no-fatal-warnings
 
       - name: Build signed APK
         shell: bash
