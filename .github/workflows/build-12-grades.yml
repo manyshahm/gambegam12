@@ -1,0 +1,138 @@
+name: Build 12 Grade Apps
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_base:
+        description: 'Base Android package. Example: ir.miplus.gambegam'
+        required: false
+        default: 'ir.miplus.gambegam'
+      api_url:
+        description: 'Gamino API base URL'
+        required: false
+        default: 'https://gaminoapp.ir/gamino/api'
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Grade ${{ matrix.grade }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        grade: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager 'platforms;android-36'
+          fi
+
+      - name: Resolve grade build configuration
+        id: cfg
+        shell: bash
+        env:
+          INPUT_PACKAGE_BASE: ${{ github.event.inputs.package_base }}
+          REPO_PACKAGE_BASE: ${{ vars.GAMBEGAM_PACKAGE_BASE }}
+        run: |
+          set -euo pipefail
+          PACKAGE_BASE="${INPUT_PACKAGE_BASE:-${REPO_PACKAGE_BASE:-ir.miplus.gambegam}}"
+          if ! [[ "$PACKAGE_BASE" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "Invalid package base: $PACKAGE_BASE" >&2
+            exit 2
+          fi
+          export PACKAGE_BASE
+          ./scripts/grade_config.sh '${{ matrix.grade }}' > /tmp/grade.env
+          cat /tmp/grade.env
+          cat /tmp/grade.env >> "$GITHUB_ENV"
+          while IFS='=' read -r key value; do
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+          done < /tmp/grade.env
+
+      - name: Prepare Android wrapper and signing
+        shell: bash
+        run: ./scripts/prepare_android_wrapper.sh
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Static analysis
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build APK
+        shell: bash
+        env:
+          API_INPUT: ${{ github.event.inputs.api_url }}
+        run: |
+          set -euo pipefail
+          API_URL="${API_INPUT:-https://gaminoapp.ir/gamino/api}"
+          APP_PACKAGE="$APP_PACKAGE" APP_LABEL="$APP_LABEL" \
+            flutter build apk --release --no-shrink --android-skip-build-dependency-validation \
+              --dart-define="TARGET_GRADE=$TARGET_GRADE" \
+              --dart-define="APP_NAME=$APP_LABEL" \
+              --dart-define="GAMINO_API_URL=$API_URL"
+
+      - name: Build AAB
+        shell: bash
+        env:
+          API_INPUT: ${{ github.event.inputs.api_url }}
+        run: |
+          set -euo pipefail
+          API_URL="${API_INPUT:-https://gaminoapp.ir/gamino/api}"
+          APP_PACKAGE="$APP_PACKAGE" APP_LABEL="$APP_LABEL" \
+            flutter build appbundle --release --no-shrink --android-skip-build-dependency-validation \
+              --dart-define="TARGET_GRADE=$TARGET_GRADE" \
+              --dart-define="APP_NAME=$APP_LABEL" \
+              --dart-define="GAMINO_API_URL=$API_URL"
+
+      - name: Package grade output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cp build/app/outputs/flutter-apk/app-release.apk "release/${APP_SLUG}_1.0.0.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "release/${APP_SLUG}_1.0.0.aab"
+          printf '%s\n' \
+            "App: $APP_LABEL" \
+            "Grade: $TARGET_GRADE" \
+            "Package: $APP_PACKAGE" \
+            "Version: 1.0.0 (1)" \
+            "Backend: Gamino guest.books" \
+            "Registration: disabled/not present" \
+            "Gamino statistics: not sent" \
+            > "release/${APP_SLUG}_BUILD_INFO.txt"
+          (cd release && zip -q "${APP_SLUG}_1.0.0_APK_AAB.zip" "${APP_SLUG}_1.0.0.apk" "${APP_SLUG}_1.0.0.aab" "${APP_SLUG}_BUILD_INFO.txt")
+
+      - name: Upload grade artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.cfg.outputs.APP_SLUG }}-1.0.0
+          path: release/${{ steps.cfg.outputs.APP_SLUG }}_1.0.0_APK_AAB.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
