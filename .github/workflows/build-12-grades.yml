@@ -1,4 +1,4 @@
-name: Build 12 Grade Apps
+name: Build 12 Grade Apps From Any ZIP
 
 on:
   workflow_dispatch:
@@ -28,20 +28,102 @@ jobs:
         grade: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Find any Flutter ZIP and extract it
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo '============================================================'
+          echo ' GAMINO — AUTO FIND FLUTTER ZIP'
+          echo ' ZIP filename is NOT hardcoded.'
+          echo '============================================================'
+
+          mapfile -d '' ALL_ZIPS < <(
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f \
+              -iname '*.zip' \
+              ! -path '*/.git/*' \
+              ! -path '*/_project/*' \
+              -print0
+          )
+
+          if (( ${#ALL_ZIPS[@]} == 0 )); then
+            echo 'ERROR: No .zip file was found in the repository.' >&2
+            exit 10
+          fi
+
+          VALID_ZIPS=()
+          for ZIP_FILE in "${ALL_ZIPS[@]}"; do
+            echo "Checking: ${ZIP_FILE#$GITHUB_WORKSPACE/}"
+            LISTING="$(unzip -Z1 "$ZIP_FILE" 2>/dev/null || true)"
+            [[ -n "$LISTING" ]] || continue
+
+            while IFS= read -r PUBSPEC; do
+              [[ -n "$PUBSPEC" ]] || continue
+              ROOT_PREFIX="${PUBSPEC%pubspec.yaml}"
+              if grep -Fxq "${ROOT_PREFIX}lib/main.dart" <<< "$LISTING"; then
+                VALID_ZIPS+=("$ZIP_FILE")
+                echo '  -> valid Flutter source ZIP'
+                break
+              fi
+            done < <(grep -E '(^|/)pubspec\.yaml$' <<< "$LISTING" || true)
+          done
+
+          if (( ${#VALID_ZIPS[@]} == 0 )); then
+            echo 'ERROR: ZIP file(s) exist, but none contains a Flutter project with pubspec.yaml + lib/main.dart.' >&2
+            echo 'ZIP files found:' >&2
+            printf ' - %s\n' "${ALL_ZIPS[@]#$GITHUB_WORKSPACE/}" >&2
+            exit 11
+          fi
+
+          if (( ${#VALID_ZIPS[@]} > 1 )); then
+            echo 'ERROR: More than one valid Flutter source ZIP was found.' >&2
+            echo 'Keep only one Flutter source ZIP in the repository:' >&2
+            for Z in "${VALID_ZIPS[@]}"; do
+              echo " - ${Z#$GITHUB_WORKSPACE/}" >&2
+            done
+            exit 12
+          fi
+
+          SELECTED_ZIP="${VALID_ZIPS[0]}"
+          echo "Selected ZIP: ${SELECTED_ZIP#$GITHUB_WORKSPACE/}"
+
+          EXTRACT_DIR="$RUNNER_TEMP/gamino_flutter_source"
+          rm -rf "$EXTRACT_DIR" "$GITHUB_WORKSPACE/_project"
+          mkdir -p "$EXTRACT_DIR" "$GITHUB_WORKSPACE/_project"
+          unzip -q "$SELECTED_ZIP" -d "$EXTRACT_DIR"
+
+          PROJECT_ROOTS=()
+          while IFS= read -r -d '' PUBSPEC_FILE; do
+            DIR="$(dirname "$PUBSPEC_FILE")"
+            if [[ -f "$DIR/lib/main.dart" ]]; then
+              PROJECT_ROOTS+=("$DIR")
+            fi
+          done < <(find "$EXTRACT_DIR" -type f -name pubspec.yaml -print0)
+
+          if (( ${#PROJECT_ROOTS[@]} != 1 )); then
+            echo "ERROR: Expected exactly one Flutter app root after extraction; found ${#PROJECT_ROOTS[@]}." >&2
+            for D in "${PROJECT_ROOTS[@]}"; do
+              echo " - $D" >&2
+            done
+            exit 13
+          fi
+
+          cp -a "${PROJECT_ROOTS[0]}/." "$GITHUB_WORKSPACE/_project/"
+
+          test -f "$GITHUB_WORKSPACE/_project/pubspec.yaml"
+          test -f "$GITHUB_WORKSPACE/_project/lib/main.dart"
+
+          echo 'Flutter project normalized to: _project/'
+          echo "PROJECT_DIR=$GITHUB_WORKSPACE/_project" >> "$GITHUB_ENV"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Ensure build scripts are executable
-        shell: bash
-        run: |
-          chmod +x scripts/*.sh || true
-          chmod +x android/gradlew || true
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -50,10 +132,18 @@ jobs:
           channel: stable
           cache: true
 
+      - name: Ensure build scripts are executable
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          chmod +x scripts/*.sh || true
+          chmod +x android/gradlew || true
+
       - name: Install Android SDK 36
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           if command -v sdkmanager >/dev/null 2>&1; then
             yes | sdkmanager --licenses >/dev/null 2>&1 || true
             sdkmanager 'platforms;android-36'
@@ -66,11 +156,12 @@ jobs:
           INPUT_PACKAGE_BASE: ${{ github.event.inputs.package_base }}
           REPO_PACKAGE_BASE: ${{ vars.GAMBEGAM_PACKAGE_BASE }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
           PACKAGE_BASE="${INPUT_PACKAGE_BASE:-${REPO_PACKAGE_BASE:-ir.miplus.gambegam}}"
           if ! [[ "$PACKAGE_BASE" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
             echo "Invalid package base: $PACKAGE_BASE" >&2
-            exit 2
+            exit 20
           fi
           export PACKAGE_BASE
           ./scripts/grade_config.sh '${{ matrix.grade }}' > /tmp/grade.env
@@ -82,20 +173,32 @@ jobs:
 
       - name: Prepare Android wrapper and signing
         shell: bash
-        run: ./scripts/prepare_android_wrapper.sh
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          ./scripts/prepare_android_wrapper.sh
 
       - name: Get packages
-        run: flutter pub get
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
 
       - name: Static analysis
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Build APK
         shell: bash
         env:
           API_INPUT: ${{ github.event.inputs.api_url }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
           API_URL="${API_INPUT:-https://gaminoapp.ir/gamino/api}"
           APP_PACKAGE="$APP_PACKAGE" APP_LABEL="$APP_LABEL" \
             flutter build apk --release --no-shrink --android-skip-build-dependency-validation \
@@ -108,7 +211,8 @@ jobs:
         env:
           API_INPUT: ${{ github.event.inputs.api_url }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
           API_URL="${API_INPUT:-https://gaminoapp.ir/gamino/api}"
           APP_PACKAGE="$APP_PACKAGE" APP_LABEL="$APP_LABEL" \
             flutter build appbundle --release --no-shrink --android-skip-build-dependency-validation \
@@ -119,7 +223,9 @@ jobs:
       - name: Package grade output
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          cd "$PROJECT_DIR"
+          rm -rf release
           mkdir -p release
           cp build/app/outputs/flutter-apk/app-release.apk "release/${APP_SLUG}_1.0.0.apk"
           cp build/app/outputs/bundle/release/app-release.aab "release/${APP_SLUG}_1.0.0.aab"
@@ -132,13 +238,16 @@ jobs:
             "Registration: disabled/not present" \
             "Gamino statistics: not sent" \
             > "release/${APP_SLUG}_BUILD_INFO.txt"
-          (cd release && zip -q "${APP_SLUG}_1.0.0_APK_AAB.zip" "${APP_SLUG}_1.0.0.apk" "${APP_SLUG}_1.0.0.aab" "${APP_SLUG}_BUILD_INFO.txt")
+          (cd release && zip -q "${APP_SLUG}_1.0.0_APK_AAB.zip" \
+            "${APP_SLUG}_1.0.0.apk" \
+            "${APP_SLUG}_1.0.0.aab" \
+            "${APP_SLUG}_BUILD_INFO.txt")
 
       - name: Upload grade artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.cfg.outputs.APP_SLUG }}-1.0.0
-          path: release/${{ steps.cfg.outputs.APP_SLUG }}_1.0.0_APK_AAB.zip
+          path: _project/release/${{ steps.cfg.outputs.APP_SLUG }}_1.0.0_APK_AAB.zip
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
