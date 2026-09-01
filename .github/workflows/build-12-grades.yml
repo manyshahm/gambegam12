@@ -1,34 +1,134 @@
-name: Build 12 Grade Apps From Uploaded ZIP
+name: Build 12 Grade Apps - ZIP Source
 
 on:
-  workflow_dispatch:
-    inputs:
-      package_base:
-        description: 'Base Android package, e.g. ir.miplus.gambegam'
-        required: false
-        default: 'ir.miplus.gambegam'
-      api_url:
-        description: 'Gamino API base URL'
-        required: false
-        default: 'https://gaminoapp.ir/gamino/api'
   push:
-    branches: [main, master]
+    branches:
+      - main
     paths:
+      - '*.zip'
       - '**/*.zip'
       - '.github/workflows/build-12-grades.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: gambegam-12apps-${{ github.ref }}
+  group: gambegam-12-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  prepare:
+    name: Detect source and icons
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      source_zip: ${{ steps.detect.outputs.source_zip }}
+      icons_zip: ${{ steps.detect.outputs.icons_zip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect source ZIP and 12-icon ZIP
+        id: detect
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          CURRENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import os
+          import subprocess
+          import zipfile
+          from pathlib import Path, PurePosixPath
+
+          event = os.environ.get('EVENT_NAME', '')
+          before = os.environ.get('BEFORE_SHA', '')
+          current = os.environ.get('CURRENT_SHA', 'HEAD')
+          output = Path(os.environ['GITHUB_OUTPUT'])
+          image_exts = {'.png', '.jpg', '.jpeg', '.webp'}
+
+          def git_lines(*args):
+              proc = subprocess.run(['git', *args], text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=False)
+              return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+          tracked = [p for p in git_lines('ls-files') if p.lower().endswith('.zip') and Path(p).is_file()]
+          if not tracked:
+              raise SystemExit('ERROR: No ZIP files are tracked in this repository.')
+
+          if event == 'push' and before and set(before) != {'0'}:
+              changed = set(git_lines('diff', '--name-only', '--diff-filter=AM', before, current))
+          elif event == 'push':
+              changed = set(tracked)
+          else:
+              changed = set()
+
+          def members(path):
+              try:
+                  with zipfile.ZipFile(path) as zf:
+                      if zf.testzip() is not None:
+                          return None
+                      return [n.replace('\\', '/') for n in zf.namelist() if not n.endswith('/')]
+              except (OSError, zipfile.BadZipFile):
+                  return None
+
+          def is_source(path):
+              names = members(path)
+              if not names:
+                  return False
+              basenames = {PurePosixPath(n).name for n in names}
+              if '.gambegam12-source' not in basenames:
+                  return False
+              pubspecs = [n for n in names if PurePosixPath(n).name == 'pubspec.yaml']
+              mains = [n for n in names if n.endswith('/lib/main.dart') or n == 'lib/main.dart']
+              return bool(pubspecs and mains)
+
+          def is_icons(path):
+              names = members(path)
+              if not names:
+                  return False
+              if any(PurePosixPath(n).name == '.gambegam12-source' for n in names):
+                  return False
+              blocked_exts = {'.php', '.dart', '.yaml', '.yml', '.gradle', '.jks', '.aab', '.apk'}
+              if any(PurePosixPath(n).suffix.lower() in blocked_exts for n in names):
+                  return False
+              images = [n for n in names if PurePosixPath(n).suffix.lower() in image_exts]
+              # The user's icon archive is defined as exactly one image per grade.
+              return len(images) == 12
+
+          def commit_time(path):
+              lines = git_lines('log', '-1', '--format=%ct', '--', path)
+              return int(lines[0]) if lines and lines[0].isdigit() else 0
+
+          sources = [p for p in tracked if is_source(p)]
+          icons = [p for p in tracked if is_icons(p)]
+          if not sources:
+              raise SystemExit('ERROR: No valid 12-grade Flutter source ZIP found. The source ZIP must contain .gambegam12-source, pubspec.yaml and lib/main.dart.')
+          if not icons:
+              raise SystemExit('ERROR: No icon ZIP found. Upload the icon ZIP containing exactly 12 PNG/JPG/JPEG/WEBP files (one per grade).')
+
+          changed_sources = [p for p in sources if p in changed]
+          changed_icons = [p for p in icons if p in changed]
+          source = max(changed_sources or sources, key=lambda p: (commit_time(p), p))
+          icon_zip = max(changed_icons or icons, key=lambda p: (commit_time(p), p))
+
+          print(f'Selected source ZIP: {source}')
+          print(f'Selected icons ZIP: {icon_zip}')
+          with output.open('a', encoding='utf-8') as f:
+              f.write(f'source_zip={source}\n')
+              f.write(f'icons_zip={icon_zip}\n')
+          PY
+
   build:
     name: Grade ${{ matrix.grade }}
+    needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -41,334 +141,278 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect newest valid source ZIP
+      - name: Extract and verify Flutter source
         id: source
         shell: bash
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          BEFORE_SHA: ${{ github.event.before }}
-          CURRENT_SHA: ${{ github.sha }}
+          SOURCE_ZIP: ${{ needs.prepare.outputs.source_zip }}
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
+          test -f "$SOURCE_ZIP"
+          EXTRACT="$RUNNER_TEMP/gambegam-source"
+          rm -rf "$EXTRACT"
+          mkdir -p "$EXTRACT"
+          python3 <<'PY'
+          import os
+          import shutil
+          import zipfile
+          from pathlib import Path, PurePosixPath
 
-          echo '============================================================'
-          echo ' GAMINO GAMBegAM — SOURCE ZIP DETECTION'
-          echo ' Filename is intentionally NOT hardcoded.'
-          echo '============================================================'
+          archive = Path(os.environ['SOURCE_ZIP'])
+          extract = Path(os.environ['RUNNER_TEMP']) / 'gambegam-source'
+          with zipfile.ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f'ERROR: Corrupt source ZIP member: {bad}')
+              root = extract.resolve()
+              for info in zf.infolist():
+                  name = info.filename.replace('\\', '/')
+                  target = (extract / name).resolve()
+                  if root != target and root not in target.parents:
+                      raise SystemExit(f'ERROR: Unsafe ZIP path: {name}')
+              zf.extractall(extract)
 
-          changed_file="$RUNNER_TEMP/changed-zips.txt"
-          all_file="$RUNNER_TEMP/all-zips.txt"
-          : > "$changed_file"
-          : > "$all_file"
+          markers = list(extract.rglob('.gambegam12-source'))
+          candidates = []
+          for marker in markers:
+              root = marker.parent
+              if (root / 'pubspec.yaml').is_file() and (root / 'lib' / 'main.dart').is_file():
+                  candidates.append(root)
+          if len(candidates) != 1:
+              raise SystemExit(f'ERROR: Expected exactly one marked Flutter project, found {len(candidates)}.')
 
-          git ls-files -z | while IFS= read -r -d '' f; do
-            if [[ "$f" =~ \.[zZ][iI][pP]$ ]] && [[ -f "$f" ]]; then
-              printf '%s\n' "$f" >> "$all_file"
-            fi
-          done
+          project = candidates[0]
+          normalized = Path(os.environ['RUNNER_TEMP']) / '_project'
+          if normalized.exists():
+              shutil.rmtree(normalized)
+          shutil.copytree(project, normalized)
+          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as f:
+              f.write(f'project_dir={normalized}\n')
+          print(f'Flutter project: {normalized}')
+          PY
 
-          if [[ "$EVENT_NAME" == "push" ]] && [[ -n "${BEFORE_SHA:-}" ]] && ! [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
-            git diff --name-only --diff-filter=AM "$BEFORE_SHA" "$CURRENT_SHA" -- '*.zip' '*.ZIP' 2>/dev/null > "$changed_file" || true
-          fi
+      - name: Resolve grade configuration
+        id: grade
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        env:
+          TARGET_GRADE: ${{ matrix.grade }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/*.sh || true
+          ./scripts/grade_config.sh "$TARGET_GRADE" > "$RUNNER_TEMP/grade.env"
+          cat "$RUNNER_TEMP/grade.env"
+          while IFS='=' read -r key value; do
+            [ -n "$key" ] || continue
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+            printf '%s=%s\n' "${key,,}" "$value" >> "$GITHUB_OUTPUT"
+          done < "$RUNNER_TEMP/grade.env"
 
-          is_valid_source_zip() {
-            local zip_path="$1"
-            local listing pubspec prefix marker
-            listing="$(unzip -Z1 "$zip_path" 2>/dev/null || true)"
-            [[ -n "$listing" ]] || return 1
-
-            while IFS= read -r pubspec; do
-              [[ -n "$pubspec" ]] || continue
-              prefix="${pubspec%pubspec.yaml}"
-              if grep -Fxq "${prefix}lib/main.dart" <<< "$listing" && \
-                 grep -Fxq "${prefix}.gambegam12-source" <<< "$listing"; then
-                return 0
-              fi
-            done < <(grep -E '(^|/)pubspec\.yaml$' <<< "$listing" || true)
-            return 1
-          }
-
-          select_best() {
-            local list_file="$1"
-            local best_zip="" best_time=-1 best_name=""
-            local zip_path commit_time
-
-            while IFS= read -r zip_path; do
-              [[ -n "$zip_path" ]] || continue
-              [[ -f "$zip_path" ]] || continue
-              if ! is_valid_source_zip "$zip_path"; then
-                echo "Ignoring non-source ZIP: $zip_path" >&2
-                continue
-              fi
-
-              commit_time="$(git log -1 --format=%ct -- "$zip_path" 2>/dev/null || true)"
-              [[ "$commit_time" =~ ^[0-9]+$ ]] || commit_time=0
-
-              if [[ -z "$best_zip" ]] || (( commit_time > best_time )) || \
-                 { (( commit_time == best_time )) && [[ "$zip_path" > "$best_name" ]]; }; then
-                best_zip="$zip_path"
-                best_time="$commit_time"
-                best_name="$zip_path"
-              fi
-            done < "$list_file"
-
-            printf '%s' "$best_zip"
-          }
-
-          selected=""
-          if [[ -s "$changed_file" ]]; then
-            selected="$(select_best "$changed_file")"
-            [[ -z "$selected" ]] || echo "Selected source from current push: $selected"
-          fi
-
-          if [[ -z "$selected" ]]; then
-            selected="$(select_best "$all_file")"
-            [[ -z "$selected" ]] || echo "Selected newest tracked source ZIP: $selected"
-          fi
-
-          if [[ -z "$selected" ]]; then
-            echo 'ERROR: No valid GAMBegAM source ZIP found.' >&2
-            echo 'The source ZIP must contain, under the same project root:' >&2
-            echo '  pubspec.yaml' >&2
-            echo '  lib/main.dart' >&2
-            echo '  .gambegam12-source' >&2
-            echo 'Tracked ZIP files:' >&2
-            sed 's/^/ - /' "$all_file" >&2 || true
-            exit 10
-          fi
-
-          echo "source_zip=$selected" >> "$GITHUB_OUTPUT"
-          echo "SOURCE_ZIP=$selected" >> "$GITHUB_ENV"
-
-      - name: Extract and verify Flutter project
-        id: project
+      - name: Extract and select launcher icon
+        id: icon
         shell: bash
         env:
-          SOURCE_ZIP: ${{ steps.source.outputs.source_zip }}
+          ICONS_ZIP: ${{ needs.prepare.outputs.icons_zip }}
+          TARGET_GRADE: ${{ matrix.grade }}
         run: |
-          set -Eeuo pipefail
+          set -euo pipefail
+          test -f "$ICONS_ZIP"
+          ICON_ROOT="$RUNNER_TEMP/grade-icons"
+          rm -rf "$ICON_ROOT"
+          mkdir -p "$ICON_ROOT"
+          python3 <<'PY'
+          import os
+          import re
+          import zipfile
+          from pathlib import Path
 
-          extract_dir="$RUNNER_TEMP/gambegam-source"
-          project_dir="$GITHUB_WORKSPACE/_project"
-          rm -rf "$extract_dir" "$project_dir"
-          mkdir -p "$extract_dir" "$project_dir"
-          unzip -q "$SOURCE_ZIP" -d "$extract_dir"
+          archive = Path(os.environ['ICONS_ZIP'])
+          out = Path(os.environ['RUNNER_TEMP']) / 'grade-icons'
+          grade = int(os.environ['TARGET_GRADE'])
+          exts = {'.png', '.jpg', '.jpeg', '.webp'}
+          words = {
+              1:'اول', 2:'دوم', 3:'سوم', 4:'چهارم', 5:'پنجم', 6:'ششم',
+              7:'هفتم', 8:'هشتم', 9:'نهم', 10:'دهم', 11:'یازدهم', 12:'دوازدهم'
+          }
+          persian_digits = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
 
-          roots=()
-          while IFS= read -r -d '' marker; do
-            root="$(dirname "$marker")"
-            if [[ -f "$root/pubspec.yaml" ]] && [[ -f "$root/lib/main.dart" ]]; then
-              roots+=("$root")
-            fi
-          done < <(find "$extract_dir" -type f -name '.gambegam12-source' -print0)
+          with zipfile.ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f'ERROR: Corrupt icon ZIP member: {bad}')
+              root = out.resolve()
+              for info in zf.infolist():
+                  name = info.filename.replace('\\', '/')
+                  target = (out / name).resolve()
+                  if root != target and root not in target.parents:
+                      raise SystemExit(f'ERROR: Unsafe icon ZIP path: {name}')
+              zf.extractall(out)
 
-          if (( ${#roots[@]} != 1 )); then
-            echo "ERROR: Expected exactly one marked Flutter project root; found ${#roots[@]}." >&2
-            printf ' - %s\n' "${roots[@]:-}" >&2
-            exit 11
-          fi
+          images = [p for p in out.rglob('*') if p.is_file() and p.suffix.lower() in exts]
+          if len(images) != 12:
+              raise SystemExit(f'ERROR: Icon ZIP must contain exactly 12 supported images; found {len(images)}.')
 
-          cp -a "${roots[0]}/." "$project_dir/"
+          def normalized_stem(p):
+              return p.stem.translate(persian_digits).lower().replace('‌', ' ')
 
-          [[ -f "$project_dir/pubspec.yaml" ]]
-          [[ -f "$project_dir/lib/main.dart" ]]
-          [[ -f "$project_dir/android/app/build.gradle" ]]
-          [[ -f "$project_dir/android/settings.gradle" ]]
-          [[ -f "$project_dir/build_support/gamino-release-key.jks" ]]
-          [[ -f "$project_dir/build_support/key.properties" ]]
+          # Detect an explicit grade from filename. Prefer longer Persian grade
+          # names first so "دوازدهم" never gets mistaken for "دهم".
+          word_order = sorted(words.items(), key=lambda kv: len(kv[1]), reverse=True)
+          def detected_grade(p):
+              s = normalized_stem(p)
+              nums = [int(x) for x in re.findall(r'(?<!\d)(0?[1-9]|1[0-2])(?!\d)', s)]
+              nums = [n for n in nums if 1 <= n <= 12]
+              if len(set(nums)) == 1:
+                  return nums[0]
+              for n, word in word_order:
+                  if word in s:
+                      return n
+              return None
 
-          grep -Eq '^version:[[:space:]]*1\.0\.0\+1[[:space:]]*$' "$project_dir/pubspec.yaml"
-          grep -q 'name: gamino_gambegam_12apps' "$project_dir/pubspec.yaml"
+          explicit = [p for p in images if detected_grade(p) == grade]
+          if len(explicit) == 1:
+              chosen = explicit[0]
+          elif len(explicit) > 1:
+              names = ', '.join(str(p.relative_to(out)) for p in explicit)
+              raise SystemExit(f'ERROR: Multiple icons match grade {grade}: {names}')
+          else:
+              names = ', '.join(str(p.relative_to(out)) for p in sorted(images))
+              raise SystemExit(
+                  f'ERROR: Could not map an icon to grade {grade} from filenames. '
+                  f'Use grade numbers 01..12 or Persian grade names in the 12 icon filenames. Files: {names}'
+              )
 
-          echo "project_dir=$project_dir" >> "$GITHUB_OUTPUT"
-          echo "PROJECT_DIR=$project_dir" >> "$GITHUB_ENV"
-          echo "Flutter project: $project_dir"
+          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as f:
+              f.write(f'icon_file={chosen}\n')
+          print(f'Grade {grade} icon: {chosen.relative_to(out)}')
+          PY
 
-      - name: Set up Java 17
+      - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Flutter 3.29.3
+      - name: Setup Flutter 3.29.3
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.29.3'
           channel: stable
           cache: true
 
-      - name: Show toolchain versions
+      - name: Ensure Android SDK 36
         shell: bash
         run: |
-          set -Eeuo pipefail
-          flutter --version
-          java -version
-
-      - name: Install Android SDK 36
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-          sdkmanager_path=""
-          if [[ -n "$sdk_root" ]] && [[ -x "$sdk_root/cmdline-tools/latest/bin/sdkmanager" ]]; then
-            sdkmanager_path="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          SDKMANAGER=""
+          if [ -n "$SDK_ROOT" ] && [ -x "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           elif command -v sdkmanager >/dev/null 2>&1; then
-            sdkmanager_path="$(command -v sdkmanager)"
+            SDKMANAGER="$(command -v sdkmanager)"
           fi
-          [[ -n "$sdkmanager_path" ]] || { echo 'ERROR: sdkmanager not found.' >&2; exit 20; }
-          yes | "$sdkmanager_path" --licenses >/dev/null 2>&1 || true
-          "$sdkmanager_path" 'platforms;android-36'
+          test -n "$SDKMANAGER" || { echo 'ERROR: sdkmanager not found'; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" 'platforms;android-36'
 
-      - name: Resolve grade configuration
-        id: cfg
+      - name: Prepare Android wrapper and signing
         shell: bash
-        env:
-          INPUT_PACKAGE_BASE: ${{ github.event.inputs.package_base }}
-          REPO_PACKAGE_BASE: ${{ vars.GAMBEGAM_PACKAGE_BASE }}
+        working-directory: ${{ steps.source.outputs.project_dir }}
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
+          set -euo pipefail
+          flutter config --no-analytics
+          flutter --version
           chmod +x scripts/*.sh || true
-
-          package_base="${INPUT_PACKAGE_BASE:-${REPO_PACKAGE_BASE:-ir.miplus.gambegam}}"
-          if ! [[ "$package_base" =~ ^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$ ]]; then
-            echo "ERROR: Invalid Android package base: $package_base" >&2
-            exit 21
-          fi
-
-          export PACKAGE_BASE="$package_base"
-          ./scripts/grade_config.sh '${{ matrix.grade }}' > "$RUNNER_TEMP/grade.env"
-          cat "$RUNNER_TEMP/grade.env"
-          cat "$RUNNER_TEMP/grade.env" >> "$GITHUB_ENV"
-
-          while IFS='=' read -r key value; do
-            [[ -n "$key" ]] || continue
-            echo "$key=$value" >> "$GITHUB_OUTPUT"
-          done < "$RUNNER_TEMP/grade.env"
-
-      - name: Prepare known-good Android wrapper and signing
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-
-          # Generate the Gradle wrapper from this exact Flutter SDK, outside the real source tree.
-          scaffold="$RUNNER_TEMP/flutter-wrapper"
-          rm -rf "$scaffold"
-          flutter create --platforms=android --org ir.miplus --project-name wrapper_app --no-pub "$scaffold" >/dev/null
-
-          mkdir -p android/gradle/wrapper android/app
-          cp "$scaffold/android/gradle/wrapper/gradle-wrapper.jar" android/gradle/wrapper/gradle-wrapper.jar
-          cp "$scaffold/android/gradlew" android/gradlew
-          cp "$scaffold/android/gradlew.bat" android/gradlew.bat
-          chmod +x android/gradlew
-
-          cat > android/gradle/wrapper/gradle-wrapper.properties <<'PROPS'
-          distributionBase=GRADLE_USER_HOME
-          distributionPath=wrapper/dists
-          distributionUrl=https\://services.gradle.org/distributions/gradle-8.7-bin.zip
-          networkTimeout=10000
-          validateDistributionUrl=true
-          zipStoreBase=GRADLE_USER_HOME
-          zipStorePath=wrapper/dists
-          PROPS
-
-          cp build_support/gamino-release-key.jks android/app/gamino-release-key.jks
-          cp build_support/key.properties android/key.properties
-          rm -rf "$scaffold"
-
-          # Regression guards: keep the Android line that already worked in Gamino builds.
-          grep -Eq 'id "com\.android\.application" version "8\.6\.0"' android/settings.gradle
-          grep -Eq 'id "org\.jetbrains\.kotlin\.android" version "2\.1\.10"' android/settings.gradle
+          ./scripts/prepare_android_wrapper.sh
+          test -f android/gradle/wrapper/gradle-wrapper.jar
+          test -f android/gradle/wrapper/gradle-wrapper.properties
+          test -f android/key.properties
+          test -f android/app/gamino-release-key.jks
+          grep -q 'gradle-8.7-bin.zip' android/gradle/wrapper/gradle-wrapper.properties
+          grep -Eq 'id "com.android.application" version "8\.6\.0"' android/settings.gradle
+          grep -Eq 'id "org.jetbrains.kotlin.android" version "2\.1\.10"' android/settings.gradle
           grep -Eq 'compileSdk[[:space:]]*=[[:space:]]*36' android/app/build.gradle
           grep -q '^android.suppressUnsupportedCompileSdk=36$' android/gradle.properties
-          grep -q '^storeFile=gamino-release-key.jks$' android/key.properties
-          [[ -s android/app/gamino-release-key.jks ]]
 
-      - name: Get Flutter packages
+      - name: Apply grade launcher icon
         shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        env:
+          ICON_FILE: ${{ steps.icon.outputs.icon_file }}
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          flutter pub get
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check --quiet pillow
+          python3 scripts/apply_grade_icon.py "$ICON_FILE"
+          test -s android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          test -s android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+
+      - name: Install Flutter packages
+        shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: flutter pub get
 
       - name: Static analysis
         shell: bash
-        run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          flutter analyze --no-fatal-infos --no-fatal-warnings
+        working-directory: ${{ steps.source.outputs.project_dir }}
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
 
       - name: Build signed APK
         shell: bash
-        env:
-          API_INPUT: ${{ github.event.inputs.api_url }}
+        working-directory: ${{ steps.source.outputs.project_dir }}
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          api_url="${API_INPUT:-https://gaminoapp.ir/gamino/api}"
-          APP_PACKAGE="$APP_PACKAGE" APP_LABEL="$APP_LABEL" \
-            flutter build apk \
-              --release \
-              --no-shrink \
-              --android-skip-build-dependency-validation \
-              --dart-define="TARGET_GRADE=$TARGET_GRADE" \
-              --dart-define="APP_NAME=$APP_LABEL" \
-              --dart-define="GAMINO_API_URL=$api_url"
-          [[ -s build/app/outputs/flutter-apk/app-release.apk ]]
+          set -euo pipefail
+          flutter build apk \
+            --release \
+            --no-shrink \
+            --android-skip-build-dependency-validation \
+            --dart-define=TARGET_GRADE="$TARGET_GRADE" \
+            --dart-define=APP_NAME="$APP_LABEL" \
+            --dart-define=GAMINO_API_URL='https://gaminoapp.ir/gamino/api' \
+            --dart-define=ADIVERY_APP_ID="$ADIVERY_APP_ID" \
+            --dart-define=ADIVERY_BANNER_ID="$ADIVERY_BANNER_ID"
+          test -s build/app/outputs/flutter-apk/app-release.apk
 
       - name: Build signed AAB
         shell: bash
-        env:
-          API_INPUT: ${{ github.event.inputs.api_url }}
+        working-directory: ${{ steps.source.outputs.project_dir }}
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          api_url="${API_INPUT:-https://gaminoapp.ir/gamino/api}"
-          APP_PACKAGE="$APP_PACKAGE" APP_LABEL="$APP_LABEL" \
-            flutter build appbundle \
-              --release \
-              --no-shrink \
-              --android-skip-build-dependency-validation \
-              --dart-define="TARGET_GRADE=$TARGET_GRADE" \
-              --dart-define="APP_NAME=$APP_LABEL" \
-              --dart-define="GAMINO_API_URL=$api_url"
-          [[ -s build/app/outputs/bundle/release/app-release.aab ]]
+          set -euo pipefail
+          flutter build appbundle \
+            --release \
+            --no-shrink \
+            --android-skip-build-dependency-validation \
+            --dart-define=TARGET_GRADE="$TARGET_GRADE" \
+            --dart-define=APP_NAME="$APP_LABEL" \
+            --dart-define=GAMINO_API_URL='https://gaminoapp.ir/gamino/api' \
+            --dart-define=ADIVERY_APP_ID="$ADIVERY_APP_ID" \
+            --dart-define=ADIVERY_BANNER_ID="$ADIVERY_BANNER_ID"
+          test -s build/app/outputs/bundle/release/app-release.aab
 
       - name: Package grade output
+        id: package
         shell: bash
+        working-directory: ${{ steps.source.outputs.project_dir }}
         run: |
-          set -Eeuo pipefail
-          cd "$PROJECT_DIR"
-          rm -rf release
-          mkdir -p release
-
-          apk="${APP_SLUG}_1.0.0.apk"
-          aab="${APP_SLUG}_1.0.0.aab"
-          info="${APP_SLUG}_BUILD_INFO.txt"
-          bundle="${APP_SLUG}_1.0.0_APK_AAB.zip"
-
-          cp build/app/outputs/flutter-apk/app-release.apk "release/$apk"
-          cp build/app/outputs/bundle/release/app-release.aab "release/$aab"
-
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/output-${APP_SLUG}"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
+          cp build/app/outputs/flutter-apk/app-release.apk "$OUT/${APP_SLUG}-${APP_PACKAGE}-1.0.0.apk"
+          cp build/app/outputs/bundle/release/app-release.aab "$OUT/${APP_SLUG}-${APP_PACKAGE}-1.0.0.aab"
           printf '%s\n' \
-            "App: $APP_LABEL" \
-            "Grade: $TARGET_GRADE" \
-            "Package: $APP_PACKAGE" \
-            'Version: 1.0.0 (1)' \
-            'Backend: Gamino guest.books' \
-            'Registration: not present' \
-            'Gamino statistics: not sent' \
-            > "release/$info"
-
-          (cd release && zip -q "$bundle" "$apk" "$aab" "$info")
-          [[ -s "release/$bundle" ]]
+            "grade=$TARGET_GRADE" \
+            "package=$APP_PACKAGE" \
+            "label=$APP_LABEL" \
+            "version=1.0.0+1" \
+            "adivery_app_id=$ADIVERY_APP_ID" \
+            "adivery_banner_id=$ADIVERY_BANNER_ID" \
+            > "$OUT/BUILD_INFO.txt"
+          echo "artifact_dir=$OUT" >> "$GITHUB_OUTPUT"
 
       - name: Upload grade artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.cfg.outputs.APP_SLUG }}-1.0.0
-          path: ${{ steps.project.outputs.project_dir }}/release/${{ steps.cfg.outputs.APP_SLUG }}_1.0.0_APK_AAB.zip
+          name: gambegam-${{ steps.grade.outputs.app_slug }}-${{ steps.grade.outputs.app_package }}
+          path: ${{ steps.package.outputs.artifact_dir }}
           if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
+          compression-level: 6
