@@ -19,19 +19,18 @@ concurrency:
 
 jobs:
   prepare:
-    name: Detect source and icons
+    name: Detect Flutter source ZIP
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       source_zip: ${{ steps.detect.outputs.source_zip }}
-      icons_zip: ${{ steps.detect.outputs.icons_zip }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Detect source ZIP and 12-icon ZIP
+      - name: Detect latest valid source ZIP
         id: detect
         shell: bash
         env:
@@ -50,14 +49,21 @@ jobs:
           before = os.environ.get('BEFORE_SHA', '')
           current = os.environ.get('CURRENT_SHA', 'HEAD')
           output = Path(os.environ['GITHUB_OUTPUT'])
-          image_exts = {'.png', '.jpg', '.jpeg', '.webp'}
 
           def git_lines(*args):
-              proc = subprocess.run(['git', *args], text=True, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, check=False)
+              proc = subprocess.run(
+                  ['git', *args],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  check=False,
+              )
               return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
-          tracked = [p for p in git_lines('ls-files') if p.lower().endswith('.zip') and Path(p).is_file()]
+          tracked = [
+              p for p in git_lines('ls-files')
+              if p.lower().endswith('.zip') and Path(p).is_file()
+          ]
           if not tracked:
               raise SystemExit('ERROR: No ZIP files are tracked in this repository.')
 
@@ -68,60 +74,50 @@ jobs:
           else:
               changed = set()
 
-          def members(path):
+          def is_source(path):
               try:
                   with zipfile.ZipFile(path) as zf:
                       if zf.testzip() is not None:
-                          return None
-                      return [n.replace('\\', '/') for n in zf.namelist() if not n.endswith('/')]
+                          return False
+                      names = [
+                          n.replace('\\', '/')
+                          for n in zf.namelist()
+                          if not n.endswith('/')
+                      ]
               except (OSError, zipfile.BadZipFile):
-                  return None
+                  return False
 
-          def is_source(path):
-              names = members(path)
-              if not names:
+              markers = [n for n in names if PurePosixPath(n).name == '.gambegam12-source']
+              if len(markers) != 1:
                   return False
-              basenames = {PurePosixPath(n).name for n in names}
-              if '.gambegam12-source' not in basenames:
-                  return False
-              pubspecs = [n for n in names if PurePosixPath(n).name == 'pubspec.yaml']
-              mains = [n for n in names if n.endswith('/lib/main.dart') or n == 'lib/main.dart']
-              return bool(pubspecs and mains)
-
-          def is_icons(path):
-              names = members(path)
-              if not names:
-                  return False
-              if any(PurePosixPath(n).name == '.gambegam12-source' for n in names):
-                  return False
-              blocked_exts = {'.php', '.dart', '.yaml', '.yml', '.gradle', '.jks', '.aab', '.apk'}
-              if any(PurePosixPath(n).suffix.lower() in blocked_exts for n in names):
-                  return False
-              images = [n for n in names if PurePosixPath(n).suffix.lower() in image_exts]
-              # The user's icon archive is defined as exactly one image per grade.
-              return len(images) == 12
+              project_root = str(PurePosixPath(markers[0]).parent)
+              prefix = '' if project_root == '.' else project_root.rstrip('/') + '/'
+              required = {
+                  prefix + 'pubspec.yaml',
+                  prefix + 'lib/main.dart',
+                  prefix + 'scripts/grade_config.sh',
+                  prefix + 'grade_icons/grade01/mipmap-mdpi/ic_launcher.png',
+                  prefix + 'grade_icons/grade12/mipmap-xxxhdpi/ic_launcher.png',
+              }
+              return required.issubset(set(names))
 
           def commit_time(path):
               lines = git_lines('log', '-1', '--format=%ct', '--', path)
               return int(lines[0]) if lines and lines[0].isdigit() else 0
 
           sources = [p for p in tracked if is_source(p)]
-          icons = [p for p in tracked if is_icons(p)]
           if not sources:
-              raise SystemExit('ERROR: No valid 12-grade Flutter source ZIP found. The source ZIP must contain .gambegam12-source, pubspec.yaml and lib/main.dart.')
-          if not icons:
-              raise SystemExit('ERROR: No icon ZIP found. Upload the icon ZIP containing exactly 12 PNG/JPG/JPEG/WEBP files (one per grade).')
+              raise SystemExit(
+                  'ERROR: No valid 12-grade source ZIP found. '
+                  'Upload the supplied source ZIP; no separate icon ZIP is required.'
+              )
 
           changed_sources = [p for p in sources if p in changed]
-          changed_icons = [p for p in icons if p in changed]
           source = max(changed_sources or sources, key=lambda p: (commit_time(p), p))
-          icon_zip = max(changed_icons or icons, key=lambda p: (commit_time(p), p))
 
           print(f'Selected source ZIP: {source}')
-          print(f'Selected icons ZIP: {icon_zip}')
           with output.open('a', encoding='utf-8') as f:
               f.write(f'source_zip={source}\n')
-              f.write(f'icons_zip={icon_zip}\n')
           PY
 
   build:
@@ -149,43 +145,46 @@ jobs:
         run: |
           set -euo pipefail
           test -f "$SOURCE_ZIP"
-          EXTRACT="$RUNNER_TEMP/gambegam-source"
-          rm -rf "$EXTRACT"
-          mkdir -p "$EXTRACT"
           python3 <<'PY'
           import os
           import shutil
           import zipfile
-          from pathlib import Path, PurePosixPath
+          from pathlib import Path
 
           archive = Path(os.environ['SOURCE_ZIP'])
           extract = Path(os.environ['RUNNER_TEMP']) / 'gambegam-source'
+          normalized = Path(os.environ['RUNNER_TEMP']) / '_project'
+
+          shutil.rmtree(extract, ignore_errors=True)
+          shutil.rmtree(normalized, ignore_errors=True)
+          extract.mkdir(parents=True, exist_ok=True)
+
           with zipfile.ZipFile(archive) as zf:
               bad = zf.testzip()
               if bad:
                   raise SystemExit(f'ERROR: Corrupt source ZIP member: {bad}')
               root = extract.resolve()
               for info in zf.infolist():
-                  name = info.filename.replace('\\', '/')
-                  target = (extract / name).resolve()
+                  target = (extract / info.filename.replace('\\', '/')).resolve()
                   if root != target and root not in target.parents:
-                      raise SystemExit(f'ERROR: Unsafe ZIP path: {name}')
+                      raise SystemExit(f'ERROR: Unsafe ZIP path: {info.filename}')
               zf.extractall(extract)
 
           markers = list(extract.rglob('.gambegam12-source'))
-          candidates = []
-          for marker in markers:
-              root = marker.parent
-              if (root / 'pubspec.yaml').is_file() and (root / 'lib' / 'main.dart').is_file():
-                  candidates.append(root)
+          candidates = [
+              marker.parent for marker in markers
+              if (marker.parent / 'pubspec.yaml').is_file()
+              and (marker.parent / 'lib' / 'main.dart').is_file()
+              and (marker.parent / 'scripts' / 'grade_config.sh').is_file()
+              and (marker.parent / 'grade_icons' / 'grade01').is_dir()
+              and (marker.parent / 'grade_icons' / 'grade12').is_dir()
+          ]
           if len(candidates) != 1:
-              raise SystemExit(f'ERROR: Expected exactly one marked Flutter project, found {len(candidates)}.')
+              raise SystemExit(
+                  f'ERROR: Expected exactly one complete marked Flutter project, found {len(candidates)}.'
+              )
 
-          project = candidates[0]
-          normalized = Path(os.environ['RUNNER_TEMP']) / '_project'
-          if normalized.exists():
-              shutil.rmtree(normalized)
-          shutil.copytree(project, normalized)
+          shutil.copytree(candidates[0], normalized)
           with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as f:
               f.write(f'project_dir={normalized}\n')
           print(f'Flutter project: {normalized}')
@@ -207,85 +206,6 @@ jobs:
             printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
             printf '%s=%s\n' "${key,,}" "$value" >> "$GITHUB_OUTPUT"
           done < "$RUNNER_TEMP/grade.env"
-
-      - name: Extract and select launcher icon
-        id: icon
-        shell: bash
-        env:
-          ICONS_ZIP: ${{ needs.prepare.outputs.icons_zip }}
-          TARGET_GRADE: ${{ matrix.grade }}
-        run: |
-          set -euo pipefail
-          test -f "$ICONS_ZIP"
-          ICON_ROOT="$RUNNER_TEMP/grade-icons"
-          rm -rf "$ICON_ROOT"
-          mkdir -p "$ICON_ROOT"
-          python3 <<'PY'
-          import os
-          import re
-          import zipfile
-          from pathlib import Path
-
-          archive = Path(os.environ['ICONS_ZIP'])
-          out = Path(os.environ['RUNNER_TEMP']) / 'grade-icons'
-          grade = int(os.environ['TARGET_GRADE'])
-          exts = {'.png', '.jpg', '.jpeg', '.webp'}
-          words = {
-              1:'اول', 2:'دوم', 3:'سوم', 4:'چهارم', 5:'پنجم', 6:'ششم',
-              7:'هفتم', 8:'هشتم', 9:'نهم', 10:'دهم', 11:'یازدهم', 12:'دوازدهم'
-          }
-          persian_digits = str.maketrans('۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩', '01234567890123456789')
-
-          with zipfile.ZipFile(archive) as zf:
-              bad = zf.testzip()
-              if bad:
-                  raise SystemExit(f'ERROR: Corrupt icon ZIP member: {bad}')
-              root = out.resolve()
-              for info in zf.infolist():
-                  name = info.filename.replace('\\', '/')
-                  target = (out / name).resolve()
-                  if root != target and root not in target.parents:
-                      raise SystemExit(f'ERROR: Unsafe icon ZIP path: {name}')
-              zf.extractall(out)
-
-          images = [p for p in out.rglob('*') if p.is_file() and p.suffix.lower() in exts]
-          if len(images) != 12:
-              raise SystemExit(f'ERROR: Icon ZIP must contain exactly 12 supported images; found {len(images)}.')
-
-          def normalized_stem(p):
-              return p.stem.translate(persian_digits).lower().replace('‌', ' ')
-
-          # Detect an explicit grade from filename. Prefer longer Persian grade
-          # names first so "دوازدهم" never gets mistaken for "دهم".
-          word_order = sorted(words.items(), key=lambda kv: len(kv[1]), reverse=True)
-          def detected_grade(p):
-              s = normalized_stem(p)
-              nums = [int(x) for x in re.findall(r'(?<!\d)(0?[1-9]|1[0-2])(?!\d)', s)]
-              nums = [n for n in nums if 1 <= n <= 12]
-              if len(set(nums)) == 1:
-                  return nums[0]
-              for n, word in word_order:
-                  if word in s:
-                      return n
-              return None
-
-          explicit = [p for p in images if detected_grade(p) == grade]
-          if len(explicit) == 1:
-              chosen = explicit[0]
-          elif len(explicit) > 1:
-              names = ', '.join(str(p.relative_to(out)) for p in explicit)
-              raise SystemExit(f'ERROR: Multiple icons match grade {grade}: {names}')
-          else:
-              names = ', '.join(str(p.relative_to(out)) for p in sorted(images))
-              raise SystemExit(
-                  f'ERROR: Could not map an icon to grade {grade} from filenames. '
-                  f'Use grade numbers 01..12 or Persian grade names in the 12 icon filenames. Files: {names}'
-              )
-
-          with Path(os.environ['GITHUB_OUTPUT']).open('a', encoding='utf-8') as f:
-              f.write(f'icon_file={chosen}\n')
-          print(f'Grade {grade} icon: {chosen.relative_to(out)}')
-          PY
 
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -322,7 +242,7 @@ jobs:
           set -euo pipefail
           flutter config --no-analytics
           flutter --version
-          chmod +x scripts/*.sh || true
+          chmod +x scripts/*.sh android/gradlew || true
           ./scripts/prepare_android_wrapper.sh
           test -f android/gradle/wrapper/gradle-wrapper.jar
           test -f android/gradle/wrapper/gradle-wrapper.properties
@@ -334,17 +254,22 @@ jobs:
           grep -Eq 'compileSdk[[:space:]]*=[[:space:]]*36' android/app/build.gradle
           grep -q '^android.suppressUnsupportedCompileSdk=36$' android/gradle.properties
 
-      - name: Apply grade launcher icon
+      - name: Apply embedded launcher icon
         shell: bash
         working-directory: ${{ steps.source.outputs.project_dir }}
-        env:
-          ICON_FILE: ${{ steps.icon.outputs.icon_file }}
         run: |
           set -euo pipefail
-          python3 -m pip install --disable-pip-version-check --quiet pillow
-          python3 scripts/apply_grade_icon.py "$ICON_FILE"
-          test -s android/app/src/main/res/mipmap-mdpi/ic_launcher.png
-          test -s android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          ICON_DIR="grade_icons/$APP_SLUG"
+          test -d "$ICON_DIR"
+          for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
+            SRC="$ICON_DIR/mipmap-$density"
+            DST="android/app/src/main/res/mipmap-$density"
+            test -s "$SRC/ic_launcher.png"
+            test -s "$SRC/ic_launcher_round.png"
+            mkdir -p "$DST"
+            cp "$SRC/ic_launcher.png" "$DST/ic_launcher.png"
+            cp "$SRC/ic_launcher_round.png" "$DST/ic_launcher_round.png"
+          done
 
       - name: Prepare pinned Adivery 4.9.0 for Dart 3
         shell: bash
@@ -369,6 +294,7 @@ jobs:
           grep -q 'pageSnap: false' lib/main.dart
           grep -q 'pageFling: true' lib/main.dart
           grep -q 'fitEachPage: false' lib/main.dart
+          test "$APP_PACKAGE" = "ir.miplus.gambegam${APP_SLUG#grade}"
 
       - name: Install Flutter packages
         shell: bash
@@ -376,7 +302,7 @@ jobs:
         run: |
           set -euo pipefail
           flutter pub get
-          flutter pub deps | grep -E '^├── adivery 4\.9\.0|^└── adivery 4\.9\.0|adivery 4\.9\.0'
+          flutter pub deps | grep -E 'adivery 4\.9\.0'
 
       - name: Static analysis
         shell: bash
