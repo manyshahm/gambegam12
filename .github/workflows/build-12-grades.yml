@@ -37,6 +37,12 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Ensure build scripts are executable
+        shell: bash
+        run: |
+          chmod +x scripts/*.sh || true
+          chmod +x android/gradlew || true
+
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
