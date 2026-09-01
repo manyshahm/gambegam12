@@ -261,6 +261,8 @@ jobs:
           set -euo pipefail
           ICON_DIR="grade_icons/$APP_SLUG"
           test -d "$ICON_DIR"
+          test -s "$ICON_DIR/source.png"
+          cp "$ICON_DIR/source.png" assets/app_icon.png
           for density in mdpi hdpi xhdpi xxhdpi xxxhdpi; do
             SRC="$ICON_DIR/mipmap-$density"
             DST="android/app/src/main/res/mipmap-$density"
@@ -295,6 +297,12 @@ jobs:
           grep -q 'pageFling: true' lib/main.dart
           grep -q 'fitEachPage: false' lib/main.dart
           ! grep -q 'showScrollIndicators:' lib/main.dart
+          grep -q 'BannerAdSize.LARGE_BANNER' lib/main.dart
+          grep -q 'Duration(seconds: 30)' lib/main.dart
+          grep -q 'Duration(seconds: 40)' lib/main.dart
+          grep -q 'Duration(milliseconds: 2500)' lib/main.dart
+          grep -q 'ADIVERY_INTERSTITIAL_ID' lib/main.dart
+          test -n "$ADIVERY_INTERSTITIAL_ID"
           test "$APP_PACKAGE" = "ir.miplus.gambegam${APP_SLUG#grade}"
 
       - name: Install Flutter packages
@@ -323,7 +331,8 @@ jobs:
             --dart-define=APP_NAME="$APP_LABEL" \
             --dart-define=GAMINO_API_URL='https://gaminoapp.ir/gamino/api' \
             --dart-define=ADIVERY_APP_ID="$ADIVERY_APP_ID" \
-            --dart-define=ADIVERY_BANNER_ID="$ADIVERY_BANNER_ID"
+            --dart-define=ADIVERY_BANNER_ID="$ADIVERY_BANNER_ID" \
+            --dart-define=ADIVERY_INTERSTITIAL_ID="$ADIVERY_INTERSTITIAL_ID"
           test -s build/app/outputs/flutter-apk/app-release.apk
 
       - name: Build signed AAB
@@ -339,7 +348,8 @@ jobs:
             --dart-define=APP_NAME="$APP_LABEL" \
             --dart-define=GAMINO_API_URL='https://gaminoapp.ir/gamino/api' \
             --dart-define=ADIVERY_APP_ID="$ADIVERY_APP_ID" \
-            --dart-define=ADIVERY_BANNER_ID="$ADIVERY_BANNER_ID"
+            --dart-define=ADIVERY_BANNER_ID="$ADIVERY_BANNER_ID" \
+            --dart-define=ADIVERY_INTERSTITIAL_ID="$ADIVERY_INTERSTITIAL_ID"
           test -s build/app/outputs/bundle/release/app-release.aab
 
       - name: Package grade output
