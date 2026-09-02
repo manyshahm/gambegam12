@@ -294,7 +294,7 @@ jobs:
           ! grep -q 'CardThemeData(' lib/main.dart
           grep -q 'path: third_party/adivery' pubspec.yaml
           grep -q 'pageSnap: false' lib/main.dart
-          grep -q 'pageFling: true' lib/main.dart
+          grep -q 'pageFling: false' lib/main.dart
           grep -q 'fitEachPage: false' lib/main.dart
           ! grep -q 'showScrollIndicators:' lib/main.dart
           grep -q 'BannerAdSize.LARGE_BANNER' lib/main.dart
